@@ -1,0 +1,266 @@
+name: EKS Deployment Pipeline
+
+# ============================================================
+# This pipeline runs on every push / PR to main.
+# It executes the full DevSecOps gate (tests → SAST → SCA →
+# Docker build → image scan → push to Docker Hub) and then
+# deploys the freshly‑built image to an AWS EKS cluster.
+#
+# Required GitHub Secrets:
+#   DOCKERHUB_TOKEN       – Docker Hub access token
+#   AWS_ACCESS_KEY_ID     – IAM user / role access key
+#   AWS_SECRET_ACCESS_KEY – IAM user / role secret key
+#
+# Required GitHub Variables (Settings → Variables):
+#   EKS_CLUSTER_NAME      – e.g.  my-eks-cluster
+# ============================================================
+
+on:
+  push:
+    branches:
+      - feature/*
+  pull_request:
+    branches:
+      - feature/*
+
+env:
+  AWS_REGION: us-east-1
+  DOCKER_IMAGE: nensiravaliya28/hey-cicd
+
+
+jobs:
+
+  # ========================================
+  # STEP 1 — Run Unit Tests
+  # ========================================
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: pytest --cov=app --cov-report=term-missing
+
+
+  # ========================================
+  # STEP 2 — SAST (Static Application Security Testing)
+  # ========================================
+
+  sast:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Analyze code
+        uses: github/codeql-action/analyze@v3
+
+
+  # ========================================
+  # STEP 3 — SCA (Software Composition Analysis)
+  # ========================================
+
+  sca:
+    name: SCA - Dependency Scan
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies + pip-audit
+        run: |
+          pip install -r requirements.txt
+          pip install pip-audit
+
+      - name: Run dependency vulnerability scan
+        run: pip-audit
+
+
+  # ========================================
+  # STEP 4 — Build Docker Image
+  #          (runs only after steps 1, 2, 3 pass)
+  # ========================================
+
+  docker-build:
+    name: Docker Build
+    needs:
+      - test
+      - sast
+      - sca
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} .
+
+
+  # ========================================
+  # STEP 5 — Scan Docker Image for vulnerabilities
+  # ========================================
+
+  image-scan:
+    name: Image Scan - Trivy
+    needs:
+      - docker-build
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image (rebuild for scan)
+        run: docker build -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} .
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Scan image for HIGH/CRITICAL CVEs
+        run: trivy image --severity HIGH,CRITICAL ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+
+
+  # ========================================
+  # STEP 6 — Push image to Docker Hub
+  # ========================================
+
+  push:
+    name: Push Image to Docker Hub
+    needs:
+      - image-scan
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: nensiravaliya28
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and tag image
+        run: |
+          docker build \
+            -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} \
+            -t ${{ env.DOCKER_IMAGE }}:latest \
+            .
+
+      - name: Push image to Docker Hub
+        run: |
+          docker push ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+          docker push ${{ env.DOCKER_IMAGE }}:latest
+
+
+  # ========================================
+  # STEP 7 — Deploy to AWS EKS Cluster
+  #          (only runs on push to main, not PRs)
+  # ========================================
+
+  deploy-eks:
+    name: Deploy to EKS
+    needs:
+      - push
+    runs-on: ubuntu-latest
+
+    # Only deploy real merges to main — skip on pull_request events
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Configure AWS credentials ──────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Point kubectl at your EKS cluster ─────────────────────────────────
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name   ${{ vars.EKS_CLUSTER_NAME }}
+
+      # ── Inject the exact image tag built in this run ───────────────────────
+      - name: Inject image tag into deployment manifest
+        run: |
+          sed -i "s|__IMAGE_TAG__|${{ github.sha }}|g" k8s/deployment.yaml
+
+      # ── Apply Kubernetes manifests ─────────────────────────────────────────
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      # ── Wait for rollout to complete ───────────────────────────────────────
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/session17-python --timeout=120s
+
+      # ── Print pod status for visibility ───────────────────────────────────
+      - name: Show running pods
+        run: |
+          kubectl get pods -l app=session17-python -o wide
+
+      # ── Retrieve the LoadBalancer URL (EKS uses AWS ELB) ──────────────────
+      - name: Get LoadBalancer endpoint
+        run: |
+          echo "Waiting for LoadBalancer to assign an external hostname..."
+          for i in $(seq 1 12); do
+            HOSTNAME=$(kubectl get svc session17-python \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            if [ -n "$HOSTNAME" ]; then
+              echo "Application is live at: http://$HOSTNAME"
+              break
+            fi
+            echo "  attempt $i/12 — not ready yet, waiting 10s..."
+            sleep 10
+          done
