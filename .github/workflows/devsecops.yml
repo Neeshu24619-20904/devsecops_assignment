@@ -173,14 +173,14 @@ jobs:
       - name: Build and tag image
         run: |
           docker build \
-            -t Neeshu24619-20904/devsecops_assignment:${{ github.sha }} \
-            -t Neeshu24619-20904/devsecops_assignment:latest \
+            -t neeshu24619/devsecops_assignment:${{ github.sha }} \
+            -t neeshu24619/devsecops_assignment:latest \
             .
 
       - name: Push image
         run: |
-          docker push Neeshu24619-20904/devsecops_assignment:${{ github.sha }}
-          docker push Neeshu24619-20904/devsecops_assignment:latest
+          docker push neeshu24619/devsecops_assignment:${{ github.sha }}
+          docker push neeshu24619/devsecops_assignment:latest
 
 
   # ========================================
